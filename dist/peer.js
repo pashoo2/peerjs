@@ -1,4 +1,7 @@
-/*! peerjs build:0.3.14, development. Copyright(c) 2013 Michelle Bu <michelle@michellebu.com> */(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+//!!! source = https://github.com/nttcom/peerjs
+/*! peerjs build:0.3.14, development. Copyright(c) 2013 Michelle Bu <michelle@michellebu.com> 2015 NTT Communications Corporation */(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
+"use strict";
+
 module.exports.RTCSessionDescription = window.RTCSessionDescription ||
 	window.mozRTCSessionDescription;
 module.exports.RTCPeerConnection = window.RTCPeerConnection ||
@@ -20,7 +23,7 @@ function DataConnection(peer, provider, options) {
   EventEmitter.call(this);
 
   this.options = util.extend({
-    serialization: 'binary',
+    serialization: 'json', //usr-- original: serialization: 'binary', --usr
     reliable: false
   }, options);
 
@@ -49,6 +52,7 @@ function DataConnection(peer, provider, options) {
     this._peerBrowser = this.options._payload.browser;
   }
 
+  util.log("startConnection from DataConnection");
   Negotiator.startConnection(
     this,
     this.options._payload || {
@@ -98,6 +102,38 @@ DataConnection.prototype._configureDataChannel = function() {
   };
 }
 
+//usr--
+DataConnection.prototype._handleDataMessageOnJSONParsed = function(data) {
+    if ( data instanceof Error === true ) {
+        util.log(data);
+        return;    
+    }
+     /// Check if we've chunked--if so, piece things back together.
+	  // We're guaranteed that this isn't 0.
+	  if (data.__peerData) {
+  		var id = data.__peerData;
+  		var chunkInfo = this._chunkedData[id] || {data: [], count: 0, total: data.total};
+  
+  		chunkInfo.data[data.n] = data.data;
+  		chunkInfo.count += 1;
+  
+  		if (chunkInfo.total === chunkInfo.count) {
+  		  // Clean up before making the recursive call to `_handleDataMessage`.
+  		  delete this._chunkedData[id];
+  
+  		  // We've received all the chunks--time to construct the complete data.
+  		  data = new Blob(chunkInfo.data);
+  		  this._handleDataMessage({data: data});
+  		}
+  
+  		this._chunkedData[id] = chunkInfo;
+  		return;
+	  }
+    
+    this.emit('data', data); 
+    this.decreaseNumIncompleteAsyncOperations(); //after the JSON parse has done will decrease the num of async ops   
+}; //--usr
+
 // Handles a DataChannel message.
 DataConnection.prototype._handleDataMessage = function(e) {
   var self = this;
@@ -119,7 +155,19 @@ DataConnection.prototype._handleDataMessage = function(e) {
       data = util.unpack(ab);
     }
   } else if (this.serialization === 'json') {
-    data = JSON.parse(data);
+	//usr--
+    if ( this._flDoNotParseJSON !== undefined ) {
+      this._handleDataMessageOnJSONParsed(data); //no need to parse the an incoming data
+    } else {
+      if ( JSON.parseAsync !== undefined ) {
+        this.increaseNumIncompleteAsyncOperations(); //increase num of async ops by async JSON parse
+        JSON.parseAsync(data, this._handleDataMessageOnJSONParsed, this);
+      } else {
+        this._handleDataMessageOnJSONParsed(JSON.parse(data)); 
+      }
+       //--usr
+    }
+	return;
   }
 
   // Check if we've chunked--if so, piece things back together.
@@ -152,13 +200,33 @@ DataConnection.prototype._handleDataMessage = function(e) {
  */
 
 /** Allows user to close connection. */
-DataConnection.prototype.close = function() {
-  if (!this.open) {
-    return;
+//usr-- if flCloseForcibly = true, then close without any delays and checkouts --usr
+DataConnection.prototype.close = function(flCloseForcibly) {
+  //usr--
+  if (  this._closed === true ) { //if already closed
+    return;  
   }
   this.open = false;
-  Negotiator.cleanup(this);
-  this.emit('close');
+  if ( flCloseForcibly !== true
+      && this._flCloseAfterAsyncOperations !== true
+      && this.checkNumIncompleteAsyncOperations() === true ) { //if an incompete async operations are exists
+        this._flCloseAfterAsyncOperations = true; //close after they has been completed  
+        this._timestampCloseAfterAsyncOperations = Date.now();
+        this.emit("deactivate");
+  } else {
+      Negotiator.cleanup(this);
+      this.emit('close');
+      this.removeAllListeners();
+      this._closed = true;
+  } 
+  //--usr
+  //original :
+  // if (!this.open) {
+  //   return;
+  // }
+  // this.open = false;
+  // Negotiator.cleanup(this);
+  // this.emit('close');
 }
 
 /** Allows user to send data. */
@@ -175,7 +243,18 @@ DataConnection.prototype.send = function(data, chunked) {
   }
   var self = this;
   if (this.serialization === 'json') {
-    this._bufferedSend(JSON.stringify(data));
+    //usr--
+    if ( typeof(data) === "string" || this._flDoNotParseJSON !== undefined ) {
+      this._bufferedSend(data);  
+    } else {
+      if ( JSON.stringifyAsync !== undefined ) { //if async method is available
+        this.increaseNumIncompleteAsyncOperations(); //increase the number of incompleted async operation by async JSON stringify
+        JSON.stringifyAsync(data, this._bufferedSend, this);
+      } else { //use sync
+        this._bufferedSend(JSON.stringify(data));
+      }
+    }//--usr
+    //this._bufferedSend();
   } else if (this.serialization === 'binary' || this.serialization === 'binary-utf8') {
     var blob = util.pack(data);
 
@@ -207,16 +286,67 @@ DataConnection.prototype.send = function(data, chunked) {
 }
 
 DataConnection.prototype._bufferedSend = function(msg) {
-  if (this._buffering || !this._trySend(msg)) {
+  //usr--
+  var res = !this._trySend(msg);
+  //--usr
+  if (this._buffering || res) { //original: if (this._buffering || !this._trySend(msg))
     this._buffer.push(msg);
     this.bufferSize = this._buffer.length;
+  } 
+  //usr--
+  else if ( !res ) { //if the massage was sent
+    this.decreaseNumIncompleteAsyncOperations();  
+  }
+  //--usr
+}
+
+//usr--
+//decrease the number of incomplete async operations with the data connection
+DataConnection.prototype.decreaseNumIncompleteAsyncOperations = function(){
+  if ( this._numIncompleteAsyncOps > 0 ) {
+    this._numIncompleteAsyncOps--; //decrease the number of incomplete async operations
+  }
+  //close if all async operations completed
+  if ( this._flCloseAfterAsyncOperations === true 
+      && this._numIncompleteAsyncOps === 0  ) {
+        this.close();
   }
 }
+
+//increase the number of incomplete async operations with the data connection
+DataConnection.prototype.resetNumIncompleteAsyncOperations = function(){
+  this._numIncompleteAsyncOps = 0;
+};
+
+//increase the number of incomplete async operations with the data connection
+DataConnection.prototype.increaseNumIncompleteAsyncOperations = function(){
+  if ( this._numIncompleteAsyncOps == null ) {
+    this._numIncompleteAsyncOps = 1;
+  } else {
+    this._numIncompleteAsyncOps++;
+  }
+}
+
+//check if the number of incomplete operations more then zero
+DataConnection.prototype.checkNumIncompleteAsyncOperations = function(){
+  return this._numIncompleteAsyncOps != null
+        && this._numIncompleteAsyncOps > 0;
+}
+
+//--usr
 
 // Returns true if the send succeeds.
 DataConnection.prototype._trySend = function(msg) {
   try {
-    this._dc.send(msg);
+    var data;
+
+    if ((window.webrtcDetectedBrowser === 'IE' || window.webrtcDetectedBrowser === 'safari') && msg instanceof ArrayBuffer) {
+      data = String.fromCharCode.apply(null, new Uint8Array(msg));
+    } else {     
+      data = msg;
+    }
+
+    this._dc.send(data);
   } catch (e) {
     this._buffering = true;
 
@@ -231,7 +361,6 @@ DataConnection.prototype._trySend = function(msg) {
   return true;
 }
 
-// Try to send the first message in the buffer.
 DataConnection.prototype._tryBuffer = function() {
   if (this._buffer.length === 0) {
     return;
@@ -252,6 +381,9 @@ DataConnection.prototype._sendChunks = function(blob) {
     var blob = blobs[i];
     this.send(blob, true);
   }
+  //usr--
+  this.decreaseNumIncompleteAsyncOperations();
+  //--usr
 }
 
 DataConnection.prototype.handleMessage = function(message) {
@@ -309,6 +441,7 @@ function MediaConnection(peer, provider, options) {
   this.localStream = this.options._stream;
 
   this.id = this.options.connectionId || MediaConnection._idPrefix + util.randomToken();
+  util.log("startConnection from MediaConnection");
   if (this.localStream) {
     Negotiator.startConnection(
       this,
@@ -355,6 +488,7 @@ MediaConnection.prototype.answer = function(stream) {
 
   this.options._payload._stream = stream;
 
+  util.log("startConnection from answer step");
   this.localStream = stream;
   Negotiator.startConnection(
     this,
@@ -408,13 +542,14 @@ Negotiator._idPrefix = 'pc_';
 Negotiator.startConnection = function(connection, options) {
   var pc = Negotiator._getPeerConnection(connection, options);
 
+  // Set the connection's PC.
+  connection.pc = connection.peerConnection = pc;
+
   if (connection.type === 'media' && options._stream) {
     // Add the stream.
     pc.addStream(options._stream);
   }
 
-  // Set the connection's PC.
-  connection.pc = connection.peerConnection = pc;
   // What do we need to do now?
   if (options.originator) {
     if (connection.type === 'data') {
@@ -435,7 +570,11 @@ Negotiator.startConnection = function(connection, options) {
     }
 
     if (!util.supports.onnegotiationneeded) {
-      Negotiator._makeOffer(connection);
+      //Negotiator._makeOffer(connection);
+      // firefox
+      setImmediate(function(){
+        Negotiator._makeOffer(connection);
+      });
     }
   } else {
     Negotiator.handleSDP('OFFER', connection, options.sdp);
@@ -517,12 +656,20 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
   // ICE CANDIDATES.
   util.log('Listening for ICE candidates.');
   pc.onicecandidate = function(evt) {
-    if (evt.candidate) {
-      util.log('Received ICE candidates for:', connection.peer);
+    var candidate = evt.candidate || evt;
+
+    if (!candidate || candidate.candidate == null) {
+      util.log('ICE candidates gathering complete for:', connection.peer);
+    } else {
+      util.log('Generated ICE candidate for:', connection.peer, candidate);
       provider.socket.send({
         type: 'CANDIDATE',
         payload: {
-          candidate: evt.candidate,
+          candidate: {
+            sdpMid: candidate.sdpMid,
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            candidate: candidate.candidate
+          },
           type: connection.type,
           connectionId: connection.id
         },
@@ -533,12 +680,8 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
 
   pc.oniceconnectionstatechange = function() {
     switch (pc.iceConnectionState) {
-      case 'failed':
-        util.log('iceConnectionState is disconnected, closing connections to ' + peerId);
-        connection.emit('error', new Error('Negotiation of connection to ' + peerId + ' failed.'));
-        connection.close();
-        break;
       case 'disconnected':
+      case 'failed':
         util.log('iceConnectionState is disconnected, closing connections to ' + peerId);
         connection.close();
         break;
@@ -552,15 +695,21 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
   pc.onicechange = pc.oniceconnectionstatechange;
 
   // ONNEGOTIATIONNEEDED (Chrome)
-  util.log('Listening for `negotiationneeded`');
-  pc.onnegotiationneeded = function() {
-    util.log('`negotiationneeded` triggered');
-    if (pc.signalingState == 'stable') {
-      Negotiator._makeOffer(connection);
-    } else {
-      util.log('onnegotiationneeded triggered when not stable. Is another connection being established?');
-    }
-  };
+  if (util.supports.onnegotiationneeded) {
+    util.log('Listening for `negotiationneeded`');
+    pc.onnegotiationneeded = function() {
+      util.log('`negotiationneeded` triggered');
+      if (pc.signalingState == 'stable') {
+        setTimeout(function(ev){
+          // prevent error for FF40. When callee, before handling remoteDescription, calling _makeOffer makes error
+          // cause localDescription set. Delaying calls make it fix above mismatch.
+          Negotiator._makeOffer(connection);
+        }, 1);
+      } else {
+        util.log('onnegotiationneeded triggered when not stable. Is another connection being established?');
+      }
+    };
+  }
 
   // DATACONNECTION.
   util.log('Listening for data channel');
@@ -568,7 +717,7 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
   // in the options hash.
   pc.ondatachannel = function(evt) {
     util.log('Received data channel');
-    var dc = evt.channel;
+    var dc = evt.channel || evt;
     var connection = provider.getConnection(peerId, connectionId);
     connection.initialize(dc);
   };
@@ -577,7 +726,7 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
   util.log('Listening for remote stream');
   pc.onaddstream = function(evt) {
     util.log('Received remote stream');
-    var stream = evt.stream;
+    var stream = evt.stream || evt;
     var connection = provider.getConnection(peerId, connectionId);
     // 10/10/2014: looks like in Chrome 38, onaddstream is triggered after
     // setting the remote description. Our connection object in these cases
@@ -603,6 +752,9 @@ Negotiator.cleanup = function(connection) {
 
 Negotiator._makeOffer = function(connection) {
   var pc = connection.pc;
+
+  if(!!pc.remoteDescription && !!pc.remoteDescription.type) return;
+
   pc.createOffer(function(offer) {
     util.log('Created offer.');
 
@@ -615,7 +767,10 @@ Negotiator._makeOffer = function(connection) {
       connection.provider.socket.send({
         type: 'OFFER',
         payload: {
-          sdp: offer,
+          sdp: {
+            type: offer.type,
+            sdp: offer.sdp
+          },
           type: connection.type,
           label: connection.label,
           connectionId: connection.id,
@@ -651,7 +806,10 @@ Negotiator._makeAnswer = function(connection) {
       connection.provider.socket.send({
         type: 'ANSWER',
         payload: {
-          sdp: answer,
+          sdp: {
+            type: answer.type,
+            sdp: answer.sdp
+          },
           type: connection.type,
           connectionId: connection.id,
           browser: util.browser
@@ -669,8 +827,11 @@ Negotiator._makeAnswer = function(connection) {
 }
 
 /** Handle an SDP. */
-Negotiator.handleSDP = function(type, connection, sdp) {
-  sdp = new RTCSessionDescription(sdp);
+Negotiator.handleSDP = function(type, connection, receivedSdp) {
+  var sdp = new RTCSessionDescription({
+    type: receivedSdp.type,
+    sdp: receivedSdp.sdp
+  });
   var pc = connection.pc;
 
   util.log('Setting remote description', sdp);
@@ -688,8 +849,15 @@ Negotiator.handleSDP = function(type, connection, sdp) {
 
 /** Handle a candidate. */
 Negotiator.handleCandidate = function(connection, ice) {
+/*change log*/
+  // if ice is empty, ignore
+  if (!ice) {
+    return;
+  }
+
   var candidate = ice.candidate;
   var sdpMLineIndex = ice.sdpMLineIndex;
+  //var sdpMid = ice.sdpMid;
   connection.pc.addIceCandidate(new RTCIceCandidate({
     sdpMLineIndex: sdpMLineIndex,
     candidate: candidate
@@ -734,10 +902,17 @@ function Peer(id, options) {
     config: util.defaultConfig
   }, options);
   this.options = options;
+
+  // SkyWay Original Code
+  if(options.turn === undefined){
+      options.turn = true;
+  }
+
   // Detect relative URL host.
   if (options.host === '/') {
     options.host = window.location.hostname;
   }
+
   // Set path correctly.
   if (options.path[0] !== '/') {
     options.path = '/' + options.path;
@@ -746,9 +921,17 @@ function Peer(id, options) {
     options.path += '/';
   }
 
-  // Set whether we use SSL to same as current host
-  if (options.secure === undefined && options.host !== util.CLOUD_HOST) {
+  // Set whether we use SSL to same as current host unless hosted on skyway
+  if (options.host === util.CLOUD_HOST) {
+    options.secure = true;
+  } else if (options.secure === undefined) {
     options.secure = util.isSecure();
+  }
+  // Set whether the server supports WS keepalives
+  if (options.host === util.CLOUD_HOST) {
+      util.supportsKeepAlive = true;
+  } else if (options.keepalive) {
+      util.supportsKeepAlive = options.keepalive;
   }
   // Set a custom log function if present
   if (options.logFunction) {
@@ -780,7 +963,7 @@ function Peer(id, options) {
     return;
   }
   //
-
+  
   // States.
   this.destroyed = false; // Connections have been killed
   this.disconnected = false; // Connection to PeerServer killed but P2P connections still active
@@ -790,16 +973,26 @@ function Peer(id, options) {
   // References
   this.connections = {}; // DataConnections for this peer.
   this._lostMessages = {}; // src => [list of messages]
+  
+  this.socialId = id; //set the social network id
+  
   //
-
   // Start the server connection
-  this._initializeServerConnection();
-  if (id) {
-    this._initialize(id);
-  } else {
-    this._retrieveId();
-  }
+  // SkyWay Original Code!!!
+  this._initializeServerConnection(); //usr-- original: this._initializeServerConnection(); --usr
+  //if (id) {
+  //  this._retrieveId(id);
+  //} else {
+  //  this._retrieveId();
+  //}
   //
+  //usr--
+  this.g_InnerConnections = new Map();
+  var self = this;
+  setTimeout(function(){
+    self._initialize(); ///!!!this._initialize();
+  }, 5000);  //waiting for 5 seconds, before starting the new connection(may it's necessary for the cs for a some time to clean a data of the previous connection with this peer, if it was been established
+  //--usr
 }
 
 util.inherits(Peer, EventEmitter);
@@ -808,36 +1001,89 @@ util.inherits(Peer, EventEmitter);
 // websockets.)
 Peer.prototype._initializeServerConnection = function() {
   var self = this;
-  this.socket = new Socket(this.options.secure, this.options.host, this.options.port, this.options.path, this.options.key);
-  this.socket.on('message', function(data) {
+  //usr--
+  if (this.socket instanceof Socket) { //close the previous connection
+    this.socket.close();  
+    this.socket.removeAllListeners(); //remove all listeners from the previous connection
+  }
+  //--usr
+  var _socket = this.socket = new Socket(this.options.secure, this.options.host, this.options.port, this.options.path, this.options.key);
+  
+  function onMessage(data) {
     self._handleMessage(data);
-  });
-  this.socket.on('error', function(error) {
+  }
+  
+  function onError(error) {
     self._abort('socket-error', error);
-  });
-  this.socket.on('disconnected', function() {
+  }
+  
+  function onDisconnected() {
     // If we haven't explicitly disconnected, emit error and disconnect.
-    if (!self.disconnected) {
-      self.emitError('network', 'Lost connection to server.');
+    if (!self.disconnected
+      || self.socket === this ) {
+        self.emitError('network', 'Lost connection to server.');
+       
+        //usr--
+        removeListeners();
+        //--usr
+        
+        self.disconnect();
+    }
+  }
+  
+  function onClosed() {
+    //usr--
+    if ( typeof(self.id) === "number" ) {
+      self._lastServerId = self.id;
+    }
+    
+    removeListeners();
+    
+    //--usr
+    if (!self.disconnected) { // If we haven't explicitly disconnected, emit error.
+      self._abort('socket-closed', 'Underlying socket is already closed.');
       self.disconnect();
     }
-  });
-  this.socket.on('close', function() {
-    // If we haven't explicitly disconnected, emit error.
-    if (!self.disconnected) {
-      self._abort('socket-closed', 'Underlying socket is already closed.');
-    }
-  });
+    
+  }
+  
+  _socket.on('message', onMessage);
+  _socket.on('error', onError);
+  _socket.on('disconnected', onDisconnected);
+  _socket.on('close', onClosed);
+  
+  //usr--
+  function removeListeners(){
+    _socket.removeListener('close', onClosed);
+    _socket.removeListener('disconnected', onDisconnected);
+    _socket.removeListener('error', onError);
+    _socket.removeListener('message', onMessage);
+  }
+  //--usr
+  
+   // Close sockets before unloading window
+   // Necessary as sometimes the brower doesn't close ws/xhr property
+   // especially for FF
+  // window.onbeforeunload = function(ev) {
+  //   self.destroy();
+  // };
+   
 };
 
 /** Get a unique ID from the server via XHR. */
-Peer.prototype._retrieveId = function(cb) {
+// SkyWay Original Code
+Peer.prototype._retrieveId = function(id) {
   var self = this;
   var http = new XMLHttpRequest();
   var protocol = this.options.secure ? 'https://' : 'http://';
   var url = protocol + this.options.host + ':' + this.options.port +
     this.options.path + this.options.key + '/id';
-  var queryString = '?ts=' + new Date().getTime() + '' + Math.random();
+  if(id !== undefined){
+    var queryString = '?ts=' + new Date().getTime() + '' + Math.random() + '&id=' + id;
+  }else{
+    var queryString = '?ts=' + new Date().getTime() + '' + Math.random();
+  }
+
   url += queryString;
 
   // If there's no ID we need to wait for one before trying to init socket.
@@ -866,22 +1112,56 @@ Peer.prototype._retrieveId = function(cb) {
 };
 
 /** Initialize a connection with the server. */
-Peer.prototype._initialize = function(id) {
-  this.id = id;
-  this.socket.start(this.id, this.options.token);
+Peer.prototype._initialize = function(serverid) {
+  // SkyWay Original Code
+  if(this.options.turn === true){
+    if(this.credential){
+      this.options.config.iceServers.push({
+        urls: 'turn:' + util.TURN_HOST + ':' + util.TURN_PORT + '?transport=tcp',
+        url: 'turn:' + util.TURN_HOST + ':' + util.TURN_PORT + '?transport=tcp',
+        username: this.options.key + '$' + this.id,
+        credential: this.credential
+      });
+      this.options.config.iceServers.push({
+        urls: 'turn:' + util.TURN_HOST + ':' + util.TURN_PORT + '?transport=udp',
+        url: 'turn:' + util.TURN_HOST + ':' + util.TURN_PORT + '?transport=udp',
+        username: this.options.key + '$' + this.id,
+        credential: this.credential
+      });
+      this.options.config.iceTransports = 'all';
+    }
+  }
+
+  if(this.credential && this.options.turn == true){
+    util.log('SkyWay TURN Server is available');
+  }else{
+    util.log('SkyWay TURN Server is unavailable');
+  }
+
+  this.socket.start(this.socialId, this.options.token, this.options.authservicename);
 };
 
 /** Handles messages from the server. */
 Peer.prototype._handleMessage = function(message) {
+  
+  //usr--
+  if ( message._flFromCS != null ) {
+		return;	
+  } //--usr
+  
   var type = message.type;
   var payload = message.payload;
   var peer = message.src;
-  var connection;
-
+  var connection;	
+	
   switch (type) {
     case 'OPEN': // The connection to the server is open.
-      this.emit('open', this.id);
-      this.open = true;
+      //usr--
+      this.id = message.userID; //id from the cs
+      this.socket.id = this.id;
+	    //--usr
+	    this.open = true;
+	    this.emit('open', this.id);
       break;
     case 'ERROR': // Server error.
       this._abort('server-error', payload.msg);
@@ -892,15 +1172,17 @@ Peer.prototype._handleMessage = function(message) {
     case 'INVALID-KEY': // The given API key cannot be found.
       this._abort('invalid-key', 'API KEY "' + this.options.key + '" is invalid');
       break;
-
-    //
+    case 'PING':
+      this.socket.sendPong();
+      break;
     case 'LEAVE': // Another peer has closed its connection to this peer.
       util.log('Received leave message from', peer);
       this._cleanupPeer(peer);
       break;
 
     case 'EXPIRE': // The offer sent to a peer has expired without response.
-      this.emitError('peer-unavailable', 'Could not connect to peer ' + peer);
+      util.log('Connection to peer ' + peer  +  ' is expired');
+      this._cleanupPeer(peer); //usr--
       break;
     case 'OFFER': // we should consider switching this to CALL/CONNECT, but this is the least breaking option.
       var connectionId = payload.connectionId;
@@ -917,6 +1199,7 @@ Peer.prototype._handleMessage = function(message) {
             _payload: payload,
             metadata: payload.metadata
           });
+          util.log("MediaConnection created in OFFER");
           this._addConnection(peer, connection);
           this.emit('call', connection);
         } else if (payload.type === 'data') {
@@ -982,6 +1265,203 @@ Peer.prototype._getMessages = function(connectionId) {
   }
 };
 
+//usr-- MockDataConnection
+//usr--
+	function MockDataConnection(peer, provider, options) {
+        if (!(this instanceof MockDataConnection)) return new MockDataConnection(peer, provider, options);
+        EventEmitter.call(this);
+
+        this.options = util.extend({
+            serialization: 'binary',
+            reliable: false
+        }, options);
+
+        // Connection is not open yet.
+        this.open = true;
+        this.type = 'data';
+        this.peer = peer;
+        this.provider = provider;
+
+        this.id = this.options.connectionId || MockDataConnection._idPrefix + util.randomToken();
+
+        this.label = this.options.label || this.id;
+        this.metadata = this.options.metadata;
+        this.serialization = this.options.serialization;
+        this.reliable = this.options.reliable;
+
+        // Data channel buffering.
+        this._buffer = [];
+        this._buffering = false;
+        this.bufferSize = 0;
+
+        // For storing large data.
+        this._chunkedData = {};
+
+        if (this.options._payload) {
+            this._peerBrowser = this.options._payload.browser;
+        }
+    }
+
+	MockDataConnection._idPrefix = 'dc_';
+	
+  util.inherits(MockDataConnection, EventEmitter);
+	
+	//if flCloseForcibly = true, then close without any delays and checkouts
+	MockDataConnection.prototype.close = function(flCloseForcibly) {
+    if ( this._closed === true ) {
+      return;  
+    }
+    this.open = false;
+    if ( flCloseForcibly !== true 
+        && this.checkNumIncompleteAsyncOperations() === true ) { //an async operations are exists
+          this._flCloseAfterAsyncOperations = true; //st the flag to close the data connection after all async operations
+          this._timestampCloseAfterAsyncOperations = Date.now();
+          this.emit("deactivate");          
+    } else {
+      var _self = this;
+      setImmediate(function(){
+        _self._closed = true;
+        _self.emit('close','expired');
+        _self.removeAllListeners();
+        var _Peer = _self.provider; //Peer instance
+        if (_Peer instanceof Peer) { //close the pair connection for this
+          var pairConnection = _Peer.g_getInnerPairConnection(_self);
+          if ( pairConnection != null
+              && pairConnection.open === true ) {
+                pairConnection.close();
+          }
+        } 
+      });
+    }
+  };
+	
+	 /** Allows user to send data. */
+    MockDataConnection.prototype.send = function(data, chunked) {
+        if (this.open === false) {
+            this.emit('error', new Error('Connection is not open. You should listen for the `open` event before sending messages.'));
+            return;
+        }
+        var _Peer = this.provider; //Peer instance
+        if (_Peer instanceof Peer) {
+            var pairConnection = _Peer.g_getInnerPairConnection(this); //get a pair for this connection
+            if ( pairConnection instanceof  MockDataConnection) { //if it is exists
+                if ( typeof(data) === "object" ) { //if the type is "string" it is necessary to parse the data, before emit the corresponding event
+                    if ( JSON.parseAsync !== undefined ) {
+                      var thisConnection = this;
+                      this.increaseNumIncompleteAsyncOperations(); //flag that the connection is waiting an async operation
+                      JSON.stringifyAsync(data, function(parsedData) {
+                        pairConnection.emit('data', parsedData);    
+                        thisConnection.decreaseNumIncompleteAsyncOperations();
+                      });
+                    } else {
+                       pairConnection.increaseNumIncompleteAsyncOperations();
+                       setImmediate(function(){
+                        pairConnection.emit('data', JSON.parse(data));
+                        pairConnection.decreaseNumIncompleteAsyncOperations();
+                       });
+                    }
+                } else { //if the type of data is not "string"
+                    pairConnection.increaseNumIncompleteAsyncOperations();
+                    setImmediate(function(){
+                      pairConnection.emit('data', data);
+                      pairConnection.decreaseNumIncompleteAsyncOperations();
+                    });
+                }
+            } else { //if there is no a pair for the connection
+                this.close();
+            }
+        }
+	}
+	
+		//decrease the number of incomplete async operations with the data connection
+    MockDataConnection.prototype.decreaseNumIncompleteAsyncOperations = function(){
+      if ( this._numIncompleteAsyncOps > 0 ) {
+        this._numIncompleteAsyncOps--; //decrease the number of incomplete async operations
+      }
+      //close if all async operations completed
+      if ( this._flCloseAfterAsyncOperations === true 
+          && this._numIncompleteAsyncOps === 0  ) {
+            this.close();
+      }
+    }
+    
+    //increase the number of incomplete async operations with the data connection
+    MockDataConnection.prototype.increaseNumIncompleteAsyncOperations = function(){
+      if ( this._numIncompleteAsyncOps == null ) {
+        this._numIncompleteAsyncOps = 1;
+      } else {
+        this._numIncompleteAsyncOps++;
+      }
+    }
+    
+    //reset the number of incomplete async operations with the data connection
+    MockDataConnection.prototype.resetNumIncompleteAsyncOperations = function(){
+      this._numIncompleteAsyncOps = 0;
+    };
+    
+    //check if the number of incomplete operations more then zero
+    MockDataConnection.prototype.checkNumIncompleteAsyncOperations = function(){
+      return this._numIncompleteAsyncOps != null
+            && this._numIncompleteAsyncOps > 0;
+    }
+	
+	MockDataConnection.prototype.sendQueuedMessages = function() {
+	}
+   
+    //delete a pair connection from a list
+    Peer.prototype.g_deleteInnerPairConnection = function(connection){
+        "use strict";
+        if ( this.g_InnerConnections != null ) {
+                var pairConnection = this.g_InnerConnections.get(connection); //get the pair
+                if ( pairConnection !== undefined ) {
+                    this.g_InnerConnections.delete(pairConnection);    
+                }
+                this.g_InnerConnections.delete(connection);    
+        }
+    }
+    
+    //create and store a pair for the connection
+    Peer.prototype.g_addInnerPairConnection = function(connection1, peer, options){
+        "use strict";
+        var connection2 = new MockDataConnection(peer, this, options); //connection as incoming connection
+        var _self = this;
+        this.g_InnerConnections.set(connection1, connection2);
+        this.g_InnerConnections.set(connection2, connection1);
+        connection2.open = true;
+        setImmediate(function(){
+          _self.emit('connection', connection2);
+          connection1.open = true;
+          connection1.emit("open");
+        });
+    };
+
+    //return a pair for the connection or null
+    Peer.prototype.g_getInnerPairConnection = function(connection) {
+        "use strict";
+        if (this.g_InnerConnections instanceof Map) {
+            return this.g_InnerConnections.get(connection);
+        }
+    }
+	
+	//creaqte a mock connection with itself
+	Peer.prototype.g_mockConnect = function(peer, options) {
+	  "use stricet";
+		var connection  = new MockDataConnection(peer, this, options);
+    var self = this;
+		connection.once("close", function(){ //when mock connection closed
+		    self.g_deleteInnerPairConnection(this);
+		});
+		this._addConnection(peer, connection);
+		setImmediate(function(){ //whait for some time to emit the event, named "connect"
+			self.g_addInnerPairConnection(connection, peer, options);
+		});
+		return connection;
+	}
+	
+ //--usr MockDataConnection
+
+
+
 /**
  * Returns a DataConnection to the specified peer. See documentation for a
  * complete list of options.
@@ -995,6 +1475,11 @@ Peer.prototype.connect = function(peer, options) {
     this.emitError('disconnected', 'Cannot connect to new Peer after disconnecting from server.');
     return;
   }
+  //usr--
+	if ( peer == this.id ) { //if try to connect with itself, create a MockDataConnection instead of DataConnection
+		return this.g_mockConnect(peer, options);
+	}
+	//--usr
   var connection = new DataConnection(peer, this, options);
   this._addConnection(peer, connection);
   return connection;
@@ -1019,6 +1504,7 @@ Peer.prototype.call = function(peer, stream, options) {
   options = options || {};
   options._stream = stream;
   var call = new MediaConnection(peer, this, options);
+  util.log("MediaConnection created in call method");
   this._addConnection(peer, call);
   return call;
 };
@@ -1046,8 +1532,9 @@ Peer.prototype.getConnection = function(peer, id) {
 };
 
 Peer.prototype._delayedAbort = function(type, message) {
+  "use strice"; //usr--
   var self = this;
-  util.setZeroTimeout(function(){
+  setImmediate(function(){ //usr-- original : util.setZeroTimeout
     self._abort(type, message);
   });
 };
@@ -1085,9 +1572,9 @@ Peer.prototype.emitError = function(type, err) {
  */
 Peer.prototype.destroy = function() {
   if (!this.destroyed) {
-    this._cleanup();
-    this.disconnect();
     this.destroyed = true;
+    this._cleanup();
+    this.disconnect(true);
   }
 };
 
@@ -1117,17 +1604,24 @@ Peer.prototype._cleanupPeer = function(peer) {
  * Warning: The peer can no longer create or accept connections after being
  *  disconnected. It also cannot reconnect to the server.
  */
-Peer.prototype.disconnect = function() {
+Peer.prototype.disconnect = function(flDoNotEmitEvent) {
+  "use strict"; //usr--
   var self = this;
-  util.setZeroTimeout(function(){
+  var socketToClose = this.socket; 
+  setImmediate(function(){ //usr-- original : util.setZeroTimeout
     if (!self.disconnected) {
       self.disconnected = true;
       self.open = false;
-      if (self.socket) {
-        self.socket.close();
+      if (socketToClose != null ) {
+        socketToClose.close();
       }
-      self.emit('disconnected', self.id);
-      self._lastServerId = self.id;
+      
+      //usr--
+      self._lastServerId = self.id; //--usr
+      if ( flDoNotEmitEvent !== true ) {
+        self.emit('disconnected', self.id);
+      }
+      //origin : self._lastServerId = self.id;
       self.id = null;
     }
   });
@@ -1137,7 +1631,8 @@ Peer.prototype.disconnect = function() {
 Peer.prototype.reconnect = function() {
   if (this.disconnected && !this.destroyed) {
     util.log('Attempting reconnection to server with ID ' + this._lastServerId);
-    this.disconnected = false;
+    this.open = false; //not opened
+    this.disconnected = false; //but not disconnected
     this._initializeServerConnection();
     this._initialize(this._lastServerId);
   } else if (this.destroyed) {
@@ -1161,11 +1656,16 @@ Peer.prototype.listAllPeers = function(cb) {
   var self = this;
   var http = new XMLHttpRequest();
   var protocol = this.options.secure ? 'https://' : 'http://';
-  var url = protocol + this.options.host + ':' + this.options.port +
-    this.options.path + this.options.key + '/peers';
-  var queryString = '?ts=' + new Date().getTime() + '' + Math.random();
-  url += queryString;
 
+  //!!!original:
+  //var url = protocol + this.options.host + ':' + this.options.port
+  //  + this.options.path + 'active/list/' + this.options.key;
+	var url = protocol + this.options.host + ':' + this.options.port +
+	this.options.path + this.options.key + '/peers';
+  //usr--
+  
+  //--usr
+  
   // If there's no ID we need to wait for one before trying to init socket.
   http.open('get', url, true);
   http.onerror = function(e) {
@@ -1225,46 +1725,57 @@ util.inherits(Socket, EventEmitter);
 
 
 /** Check in with ID or get one from server. */
-Socket.prototype.start = function(id, token) {
-  this.id = id;
+Socket.prototype.start = function(id, token, authservicename) {
+  this.socialId = id;
 
-  this._httpUrl += '/' + id + '/' + token;
-  this._wsUrl += '&id=' + id + '&token=' + token;
+  this._httpUrl += '/' + (id) + '/' + encodeURIComponent(token) + '/' + (authservicename);
+  this._wsUrl += '&id=' + (id) + '&token=' + encodeURIComponent(token) + '&authservicename=' + (authservicename);
 
-  this._startXhrStream();
+  //usr--
+  //original: this._startXhrStream();
+  //--usr
   this._startWebSocket();
 }
 
+//usr--
+Socket.prototype._onMessageParsedAsync = function(data) {
+	if ( data instanceof Error === true ) {
+		util.log('Invalid server message', data);
+	} else {
+		this.emit('message', data);        
+    }
+}    //--usr
 
 /** Start up websocket communications. */
 Socket.prototype._startWebSocket = function(id) {
   var self = this;
-
+  
   if (this._socket) {
     return;
   }
 
-  this._socket = new WebSocket(this._wsUrl);
-
-  this._socket.onmessage = function(event) {
-    try {
-      var data = JSON.parse(event.data);
-    } catch(e) {
-      util.log('Invalid server message', event.data);
-      return;
-    }
-    self.emit('message', data);
-  };
-
-  this._socket.onclose = function(event) {
-    util.log('Socket closed.');
-    self.disconnected = true;
-    self.emit('disconnected');
+  var _socket = this._socket = new WebSocket(this._wsUrl);
+  _socket.onmessage = function(event) {
+    //original:!!!
+	//try {
+    //  var data = JSON.parse(event.data);
+    //} catch(e) {
+    //  util.log('Invalid server message', event.data);
+    //  return;
+    //}
+    //self.emit('message', data);
+	//usr--
+	if ( JSON.parseAsync !== undefined ) {
+	  JSON.parseAsync(event.data, self._onMessageParsedAsync, self); 
+	} else {
+	  self._onMessageParsedAsync(JSON.parse(event.data));    
+	}
+	//--usr
   };
 
   // Take care of the queue of connections if necessary and make sure Peer knows
   // socket is open.
-  this._socket.onopen = function() {
+  _socket.onopen = function() {
     if (self._timeout) {
       clearTimeout(self._timeout);
       setTimeout(function(){
@@ -1272,9 +1783,46 @@ Socket.prototype._startWebSocket = function(id) {
         self._http = null;
       }, 5000);
     }
+    if (util.supportsKeepAlive) {
+      self._setWSTimeout();
+    }
     self._sendQueuedMessages();
     util.log('Socket open');
   };
+
+  _socket.onerror = function(err) {
+    util.error('WS error code '+err.code);
+  };
+
+  // Fall back to XHR if WS closes
+  _socket.onclose = function(msg) {
+      
+      var err = new Error();
+      console.log(err.stack);
+    
+      util.error("WS closed with code " + msg.code);
+      //usr-- 
+      //if(!self.disconnected) {
+      //   self._startXhrStream();
+      //}
+      util.error('WS reason of the closing '+ msg.reason + ( msg.reason ? ". Closed clearly" : ". The closing was not clean" ) );
+      self.emit('disconnected', msg.code); //emit the disconnected form the cs event
+      _removeAllListeners(); //remove all listeners for this socket
+      //--usr
+  };
+  
+  //usr-- 
+  
+  //remove listener for events fired by the WebSocket
+  function _removeAllListeners() { 
+    _socket.onclose = null;
+    _socket.onerror = null;
+    _socket.onopen  = null;
+    _socket.onmessage = null;
+  }
+  
+  //--usr
+  
 }
 
 /** Start XHR streaming. */
@@ -1363,9 +1911,20 @@ Socket.prototype._setHTTPTimeout = function() {
   }, 25000);
 }
 
+Socket.prototype._setWSTimeout = function(){
+    var self = this;
+    this._wsTimeout = setTimeout(function(){
+        if(self._wsOpen()){
+            self._socket.close();
+            util.error('WS timed out');
+        }
+    }, 45000)
+}
+
 /** Is the websocket currently open? */
 Socket.prototype._wsOpen = function() {
-  return this._socket && this._socket.readyState == 1;
+  return this._socket instanceof WebSocket 
+          && this._socket.readyState < 2; //usr-- open when the ready state = CONNECTING or OPEN original: this._socket.readyState === 1 - open only when the ready state = OPEN //--usr
 }
 
 /** Send queued messages. */
@@ -1375,8 +1934,18 @@ Socket.prototype._sendQueuedMessages = function() {
   }
 }
 
+//usr--
+Socket.prototype.sendOnStringify = function(message){
+	if ( message instanceof Error === false ) {
+		this._socket.send(message);    
+	} else {
+		util.log(message);    
+	}
+}  //--usr
+
 /** Exposed send for DC & Peer. */
 Socket.prototype.send = function(data) {
+  
   if (this.disconnected) {
     return;
   }
@@ -1388,34 +1957,66 @@ Socket.prototype.send = function(data) {
     return;
   }
 
-  if (!data.type) {
-    this.emit('error', 'Invalid message');
-    return;
-  }
-
-  var message = JSON.stringify(data);
+  //usr--
+  var flStringData = (typeof(data) === "string");
+  if ( flStringData === false
+    && !data.type) { 
+      this.emit('error', 'Invalid message');
+      return;
+  } //--usr
+  //original:var message = JSON.stringify(data);
   if (this._wsOpen()) {
-    this._socket.send(message);
-  } else {
+	  //usr--
+	  if ( flStringData === true ) { //no necessary to stringify a string
+		 this._socket.send(data); 
+	  } else { //stringify with the JSON.async
+		 if ( JSON.stringifyAsync !== undefined ) {
+		  JSON.stringifyAsync(data, this.sendOnStringify, this);  
+		 } else {
+		  this.sendOnStringify(JSON.stringify(data));  
+		 }
+	  } //usr
+	  //original:this._socket.send(message);
+  } 
+  /* XMLHttpRequest was replaced by WebSocket
+    else if(data.type !== 'PONG') {
     var http = new XMLHttpRequest();
     var url = this._httpUrl + '/' + data.type.toLowerCase();
     http.open('post', url, true);
     http.setRequestHeader('Content-Type', 'application/json');
     http.send(message);
+  }*/
+}
+
+Socket.prototype.sendPong = function() {
+  if (this._wsOpen()) {
+    this.send({type:'PONG'});
+    if (this._wsTimeout) {
+      clearTimeout(this._wsTimeout);
+    }
+    this._setWSTimeout();
   }
 }
 
 Socket.prototype.close = function() {
-  if (!this.disconnected && this._wsOpen()) {
-    this._socket.close();
+  if (!this.disconnected) {
     this.disconnected = true;
+    if(this._wsOpen()) {
+      this._socket.close();
+    }
+    if(this._http) {
+        this._http.abort();
+    }
+    clearTimeout(this._timeout);
+    this.emit("close"); //usr-- emit the close event
+    this.removeAllListeners();
   }
-}
+};
 
 module.exports = Socket;
 
 },{"./util":8,"eventemitter3":9}],8:[function(require,module,exports){
-var defaultConfig = {'iceServers': [{ 'url': 'stun:stun.l.google.com:19302' }]};
+var defaultConfig = {'iceServers': [{ 'urls': 'stun:stun.skyway.io:3478' , 'url': 'stun:stun.skyway.io:3478'}]};
 var dataCount = 1;
 
 var BinaryPack = require('js-binarypack');
@@ -1424,8 +2025,10 @@ var RTCPeerConnection = require('./adapter').RTCPeerConnection;
 var util = {
   noop: function() {},
 
-  CLOUD_HOST: '0.peerjs.com',
-  CLOUD_PORT: 9000,
+  CLOUD_HOST: 'skyway.io',
+  CLOUD_PORT: 443,
+  TURN_HOST: 'turn.skyway.io',
+  TURN_PORT: 443,
 
   // Browsers that need chunking:
   chunkedBrowsers: {'Chrome': 1},
@@ -1503,6 +2106,20 @@ var util = {
   supports: (function() {
     if (typeof RTCPeerConnection === 'undefined') {
       return {};
+    }
+
+/*change log*/
+    if (typeof window.AdapterJS !== 'undefined' && (window.webrtcDetectedBrowser === 'IE' ||
+      window.webrtcDetectedBrowser === 'safari')) {
+      return {
+        audioVideo: true,
+        data: true,
+        binaryBlob: false,
+        binary: false, // deprecated; sctp implies binary support.
+        reliable: true, // deprecated; sctp implies reliable data.
+        sctp: true,
+        onnegotiationneeded: false
+      };
     }
 
     var data = true;
@@ -1591,12 +2208,12 @@ var util = {
   // Ensure alphanumeric ids
   validateId: function(id) {
     // Allow empty ids
-    return !id || /^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/.exec(id);
+    return !id || /^[A-Za-z0-9_-]+(?:[ _-][A-Za-z0-9]+)*$/.exec(id);
   },
 
   validateKey: function(key) {
     // Allow empty keys
-    return !key || /^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/.exec(key);
+    return !key || /^[A-Za-z0-9_-]+(?:[ _-][A-Za-z0-9]+)*$/.exec(key);
   },
 
 
@@ -1725,7 +2342,8 @@ var util = {
 
   isSecure: function() {
     return location.protocol === 'https:';
-  }
+  },
+  supportsKeepAlive: false
 };
 
 module.exports = util;
@@ -1773,10 +2391,9 @@ EventEmitter.prototype._events = undefined;
  */
 EventEmitter.prototype.listeners = function listeners(event) {
   if (!this._events || !this._events[event]) return [];
-  if (this._events[event].fn) return [this._events[event].fn];
 
-  for (var i = 0, l = this._events[event].length, ee = new Array(l); i < l; i++) {
-    ee[i] = this._events[event][i].fn;
+  for (var i = 0, l = this._events[event].length, ee = []; i < l; i++) {
+    ee.push(this._events[event][i].fn);
   }
 
   return ee;
@@ -1793,31 +2410,30 @@ EventEmitter.prototype.emit = function emit(event, a1, a2, a3, a4, a5) {
   if (!this._events || !this._events[event]) return false;
 
   var listeners = this._events[event]
+    , length = listeners.length
     , len = arguments.length
+    , ee = listeners[0]
     , args
-    , i;
+    , i, j;
 
-  if ('function' === typeof listeners.fn) {
-    if (listeners.once) this.removeListener(event, listeners.fn, true);
+  if (1 === length) {
+    if (ee.once) this.removeListener(event, ee.fn, true);
 
     switch (len) {
-      case 1: return listeners.fn.call(listeners.context), true;
-      case 2: return listeners.fn.call(listeners.context, a1), true;
-      case 3: return listeners.fn.call(listeners.context, a1, a2), true;
-      case 4: return listeners.fn.call(listeners.context, a1, a2, a3), true;
-      case 5: return listeners.fn.call(listeners.context, a1, a2, a3, a4), true;
-      case 6: return listeners.fn.call(listeners.context, a1, a2, a3, a4, a5), true;
+      case 1: return ee.fn.call(ee.context), true;
+      case 2: return ee.fn.call(ee.context, a1), true;
+      case 3: return ee.fn.call(ee.context, a1, a2), true;
+      case 4: return ee.fn.call(ee.context, a1, a2, a3), true;
+      case 5: return ee.fn.call(ee.context, a1, a2, a3, a4), true;
+      case 6: return ee.fn.call(ee.context, a1, a2, a3, a4, a5), true;
     }
 
     for (i = 1, args = new Array(len -1); i < len; i++) {
       args[i - 1] = arguments[i];
     }
 
-    listeners.fn.apply(listeners.context, args);
+    ee.fn.apply(ee.context, args);
   } else {
-    var length = listeners.length
-      , j;
-
     for (i = 0; i < length; i++) {
       if (listeners[i].once) this.removeListener(event, listeners[i].fn, true);
 
@@ -1847,16 +2463,9 @@ EventEmitter.prototype.emit = function emit(event, a1, a2, a3, a4, a5) {
  * @api public
  */
 EventEmitter.prototype.on = function on(event, fn, context) {
-  var listener = new EE(fn, context || this);
-
   if (!this._events) this._events = {};
-  if (!this._events[event]) this._events[event] = listener;
-  else {
-    if (!this._events[event].fn) this._events[event].push(listener);
-    else this._events[event] = [
-      this._events[event], listener
-    ];
-  }
+  if (!this._events[event]) this._events[event] = [];
+  this._events[event].push(new EE( fn, context || this ));
 
   return this;
 };
@@ -1870,16 +2479,9 @@ EventEmitter.prototype.on = function on(event, fn, context) {
  * @api public
  */
 EventEmitter.prototype.once = function once(event, fn, context) {
-  var listener = new EE(fn, context || this, true);
-
   if (!this._events) this._events = {};
-  if (!this._events[event]) this._events[event] = listener;
-  else {
-    if (!this._events[event].fn) this._events[event].push(listener);
-    else this._events[event] = [
-      this._events[event], listener
-    ];
-  }
+  if (!this._events[event]) this._events[event] = [];
+  this._events[event].push(new EE(fn, context || this, true ));
 
   return this;
 };
@@ -1898,25 +2500,17 @@ EventEmitter.prototype.removeListener = function removeListener(event, fn, once)
   var listeners = this._events[event]
     , events = [];
 
-  if (fn) {
-    if (listeners.fn && (listeners.fn !== fn || (once && !listeners.once))) {
-      events.push(listeners);
-    }
-    if (!listeners.fn) for (var i = 0, length = listeners.length; i < length; i++) {
-      if (listeners[i].fn !== fn || (once && !listeners[i].once)) {
-        events.push(listeners[i]);
-      }
+  if (fn) for (var i = 0, length = listeners.length; i < length; i++) {
+    if (listeners[i].fn !== fn && listeners[i].once !== once) {
+      events.push(listeners[i]);
     }
   }
 
   //
   // Reset the array, or remove it completely if we have no more listeners.
   //
-  if (events.length) {
-    this._events[event] = events.length === 1 ? events[0] : events;
-  } else {
-    delete this._events[event];
-  }
+  if (events.length) this._events[event] = events;
+  else this._events[event] = null;
 
   return this;
 };
@@ -1930,7 +2524,7 @@ EventEmitter.prototype.removeListener = function removeListener(event, fn, once)
 EventEmitter.prototype.removeAllListeners = function removeAllListeners(event) {
   if (!this._events) return this;
 
-  if (event) delete this._events[event];
+  if (event) this._events[event] = null;
   else this._events = {};
 
   return this;
@@ -1956,10 +2550,9 @@ EventEmitter.EventEmitter = EventEmitter;
 EventEmitter.EventEmitter2 = EventEmitter;
 EventEmitter.EventEmitter3 = EventEmitter;
 
-//
-// Expose the module.
-//
-module.exports = EventEmitter;
+if ('object' === typeof module && module.exports) {
+  module.exports = EventEmitter;
+}
 
 },{}],10:[function(require,module,exports){
 var BufferBuilder = require('./bufferbuilder').BufferBuilder;
